@@ -78,12 +78,12 @@ The code will output the following files:
    - num_spots: Number of spots in a cell
 4. ``results.nc`` is a netCDF file containing an xarray holding the data
    - coords:
-         - image
-         - cell_label
-         - spot_label
+      - image
+      - cell_label
+      - spot_label
    - data:
-         - intensity_mean
-         - max_feret_diameter
+      - intensity_mean
+      - max_feret_diameter
 
 ## Issues
 
