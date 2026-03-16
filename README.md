@@ -66,25 +66,24 @@ The code will output the following files:
 
 1. A overlay image showing each cell, label, and identified spot in the image. An image file is created for each input image.
 2. ``results.csv`` is a CSV file containing the following columns:
-  - image: Name of image file
-  - cell_label: Label of the cell in an image
-  - spot_label: Label of the spot in an image
-  - intensity_mean: Mean intensity of each spot (in arb. units)
-  - spot_diameter: Diameter of the spot (in pixels)
+   - image: Name of image file
+   - cell_label: Label of the cell in an image
+   - spot_label: Label of the spot in an image
+   - intensity_mean: Mean intensity of each spot (in arb. units)
+   - spot_diameter: Diameter of the spot (in pixels)
 3. ``summary.csv`` is a CSV-file containing the following columns:
-  - image: Name of image file
-  - cell_label: Label of the cell in an image
-  - mean_intensity: The average of mean intensities of all spots in a cell
-  - num_spots: Number of spots in a cell
+   - image: Name of image file
+   - cell_label: Label of the cell in an image
+   - mean_intensity: The average of mean intensities of all spots in a cell
+   - num_spots: Number of spots in a cell
 4. ``results.nc`` is a netCDF file containing an xarray holding the data
-  - coords:
-    - image
-    - cell_label
-    - spot_label
-  - data:
-    - intensity_mean
-    - max_feret_diameter
-
+   - coords:
+         - image
+         - cell_label
+         - spot_label
+   - data:
+         - intensity_mean
+         - max_feret_diameter
 
 ## Issues
 
