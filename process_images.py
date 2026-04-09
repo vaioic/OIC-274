@@ -6,6 +6,7 @@ from math import sqrt
 import numpy as np
 import xarray as xr
 import pandas as pd
+import scipy.ndimage as ndi
 
 def read_image(filepath):
 
@@ -76,7 +77,7 @@ def process_files_in_dir(inputpath, outputpath, file_ext="czi"):
     summary_df = summary_ds.to_dataframe()
     summary_df.to_csv(op / "summary.csv", index=True)
 
-def analyze_image(filepath, outputpath):
+def analyze_image(filepath, outputpath, segment_only=False, useTestSeg=False):
     """
     Analyze a single image, identifying individual nuclei and labeling each 
     spot.
@@ -94,10 +95,38 @@ def analyze_image(filepath, outputpath):
         A dataset containing the measured properties of all spots in individual cells in the image. Properties include the mean intensity and the estimated diameter (max feret) of each spot.
     """
 
+    if isinstance(filepath, str):
+        filepath = Path(filepath)
+    elif isinstance(filepath, Path):
+        pass
+    else:
+        raise ValueError('Expected filepath to be a str or Path.')
+    
+    if isinstance(outputpath, str):
+        outputpath = Path(outputpath)
+    elif isinstance(outputpath, Path):
+        pass
+    else:
+        raise ValueError('Expected outputpath to be a str or Path.')
+    
+    if not outputpath.exists():
+        outputpath.mkdir(parents=True)
+
     # Image channels are C=0 (puncta), C=1 nucleus
     img = read_image(filepath)
 
-    cell_labels = segment_nuclei(img[..., 1])
+    if not useTestSeg:
+        cell_labels, raw_labels = segment_nuclei(img[..., 1])
+    else:
+        cell_labels, raw_labels = segment_nuclei_test(img[..., 1])
+
+    if segment_only:
+        overlay = skimage.segmentation.mark_boundaries(img[..., 1], cell_labels, color=(1, 1, 0), mode='thick')
+        plt.imshow(overlay)
+        plt.show()
+        exit()
+
+
     spot_labels = segment_spots(img[..., 0], cell_labels)
 
     cell_props = skimage.measure.regionprops(cell_labels)
@@ -131,24 +160,11 @@ def analyze_image(filepath, outputpath):
 
     ds = xr.concat(results, dim="id", join="outer")
 
-    # Create an overlay image
-    rgb_image = np.zeros((img.shape[0], img.shape[1], 3))
-    img = img.astype('float32')
-    img[..., 1] = (img[..., 1] - np.min(img[..., 1]))/(np.max(img[..., 1]) - np.min(img[..., 1]))
-    img[..., 0] = (img[..., 0] - np.min(img[..., 0]))/(np.max(img[..., 0]) - np.min(img[..., 0]))
+    rgb_image = generate_rgb_image(img)
 
-    # print(img.dtype)
-    # print(rgb_image.dtype)
-
-    alpha = 0.8
-    rgb_image[..., 0] = alpha * img[..., 1] + (1 - alpha) * img[..., 0]
-    rgb_image[..., 1] = alpha * img[..., 1]
-    rgb_image[..., 2] = alpha * img[..., 1] + (1 - alpha) * img[..., 0]
-
-    # plt.imshow(rgb_image)
-    # plt.show()
-
-    overlay = skimage.color.label2rgb(cell_labels, rgb_image, bg_label=0, kind='overlay', image_alpha=0.8)
+    # Overlay cell outlines
+    # overlay = skimage.color.label2rgb(cell_labels, rgb_image, bg_label=0, kind='overlay', image_alpha=0.8)
+    overlay = skimage.segmentation.mark_boundaries(rgb_image, cell_labels, color=(1, 1, 0), mode='thick')
 
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(overlay)
@@ -156,20 +172,48 @@ def analyze_image(filepath, outputpath):
     # 2. Add cell numbers
     for prop in cell_props:
         y, x = prop.centroid
-        ax.text(x, y, str(prop.label), color='yellow', fontsize=9, fontweight='bold')
+        ax.text(x, y, str(prop.label), color='yellow', fontsize=9, fontweight='normal')
 
     # 3. Add spots as distinct markers
     # We use a scatter plot so they stand out against the background
     spot_props = skimage.measure.regionprops(spot_labels)
     if spot_props:
         sy, sx = zip(*[p.centroid for p in spot_props])
-        ax.scatter(sx, sy, s=3, c='cyan', marker='+', label='Spots')
+        ax.scatter(sx, sy, s=30, marker='o', label='Spots', facecolors='none', edgecolors='cyan', linewidths=0.5)
 
-    plt.legend()
     plt.savefig(outputpath / (filepath.stem + ".png"), dpi=300, bbox_inches='tight', pad_inches=0.1)
     plt.close(fig)
 
+    # Save the raw labels as well
+    raw_label_matrix_16 = raw_labels.astype(np.uint16)
+
+    # Save as a TIFF
+    skimage.io.imsave(outputpath / (filepath.stem + "_labels.tif"), raw_label_matrix_16, check_contrast=False)
+
+    print(f"File saved to {outputpath / (filepath.stem + '.png')}")
+
     return ds
+
+def generate_rgb_image(img):
+
+    # Create an overlay image
+    img = img.astype('float32')
+    img[..., 1] = (img[..., 1] - np.min(img[..., 1]))/(np.max(img[..., 1]) - np.min(img[..., 1]))
+    img[..., 0] = (img[..., 0] - np.min(img[..., 0]))/(np.max(img[..., 0]) - np.min(img[..., 0]))
+
+    img[..., 0] = 2.5 * img[..., 0]
+    img[..., 0] = np.clip(img[..., 0], 0, 1)
+
+    rgb_image = np.zeros((img.shape[0], img.shape[1], 3))
+    # alpha = 0.4
+    rgb_image[..., 0] = img[..., 0]
+    # rgb_image[..., 1] = alpha * img[..., 0]
+    rgb_image[..., 2] = img[..., 0] + img[..., 1]
+
+    rgb_image = np.clip(rgb_image, 0, 1)
+
+    return rgb_image
+   
 
 def segment_nuclei(img):
     """
@@ -196,16 +240,107 @@ def segment_nuclei(img):
 
     mask = filtered_img > (0.5 * threshold)
 
-    mask = skimage.morphology.opening(mask, skimage.morphology.disk(5))
+    mask = skimage.morphology.isotropic_opening(mask, 15)
 
-    mask = skimage.morphology.remove_small_holes(mask, max_size=3000)
-    mask = skimage.morphology.remove_small_objects(mask, max_size=500)
+    mask = skimage.morphology.remove_small_holes(mask, max_size=10000)
+    mask = skimage.morphology.remove_small_objects(mask, max_size=1000)
+
+    mask = skimage.morphology.isotropic_closing(mask, 5)
 
     mask = skimage.segmentation.clear_border(mask)
 
-    labels = skimage.measure.label(mask)
+    # Watershed
+    dd = ndi.distance_transform_edt(mask)
 
-    return labels
+    #print(np.max(dd))
+    h = 0.2 * np.max(dd)
+    h_filtered = skimage.morphology.h_minima(-dd, h)
+    
+    markers, _ = ndi.label(h_filtered)
+    labels = skimage.segmentation.watershed(-dd, markers, mask=mask)
+
+    if not np.any(labels > 0):
+        raise ValueError("No objects were found.")
+    
+    # # Filter objects by size for images with > 10 objects
+    # props = skimage.measure.regionprops(labels)
+    # areas = np.array([p.area for p in props])
+    # label_ids = np.array([p.label for p in props])
+    # if len(areas) > 10:
+    #     # 3. Calculate IQR (Interquartile Range) for Area
+    #     # This identifies the "typical" size range of your objects.
+    #     q1, q3 = np.percentile(areas, [25, 75])
+    #     iqr = q3 - q1
+        
+    #     # Define bounds (standard multiplier is 1.5)
+    #     # Lower bound prevents noise; upper bound prevents merged "clumps"
+    #     lower_bound = q1 - (1.5 * iqr)
+    #     upper_bound = q3 + (1.5 * iqr)
+        
+    #     # 4. Filter labels based on these statistical bounds
+    #     # We also ensure the area is at least a few pixels to catch tiny noise
+    #     keep_indices = (areas >= max(5, lower_bound)) & (areas <= upper_bound)
+    #     valid_labels = label_ids[keep_indices]
+        
+    #     # 5. Create the final cleaned label map
+    #     # np.isin is the most efficient way to zero out the "bad" labels
+    #     mask = np.isin(labels, valid_labels)
+    #     cleaned_labels = np.where(mask, labels, 0)
+    # else:
+    #     cleaned_labels = labels
+
+    cleaned_labels = labels
+
+    return cleaned_labels, labels
+
+def segment_nuclei_test(img):
+
+    # Normalize the intensity of the image
+    img_norm = skimage.exposure.rescale_intensity(img, out_range=(0.0, 1.0))
+
+    img_filtered = skimage.filters.median(img_norm, skimage.morphology.footprint_rectangle((5, 5)))
+    img_filtered = skimage.filters.gaussian(img_filtered, sigma=1.0)
+    img_filtered = skimage.filters.unsharp_mask(img_filtered, radius=10, amount=2)
+
+    # plt.imshow(img_filtered)
+    # plt.show()
+    # exit()
+
+    thresh = skimage.filters.threshold_triangle(img_filtered)
+
+    mask = img_filtered > thresh
+    mask = skimage.morphology.closing(mask, skimage.morphology.disk(15))
+    mask = skimage.morphology.opening(mask, skimage.morphology.disk(40))    
+
+    mask = skimage.morphology.remove_small_holes(mask, max_size=10000)
+    mask = skimage.morphology.remove_small_objects(mask, max_size=1000)
+    mask = skimage.segmentation.clear_border(mask)
+
+    plt.imshow(mask)
+    plt.show()
+    exit()
+
+    distance = ndi.distance_transform_edt(mask)
+
+    # 2. Find local peaks (the centers of your cells)
+    # min_distance should be roughly the radius of your smallest cell
+    coords = skimage.feature.peak_local_max(distance, min_distance=25, labels=mask)
+    mask_seeds = np.zeros(distance.shape, dtype=bool)
+    mask_seeds[tuple(coords.T)] = True
+    markers = skimage.measure.label(mask_seeds)
+
+    # 3. Use the Adaptive mask as the "topology" to prevent merging
+    # We use the inverse of the distance map as the "basin"
+    labels = skimage.segmentation.watershed(-distance, markers, mask=mask)
+
+    overlay = skimage.segmentation.mark_boundaries(img_norm, labels)
+
+    plt.imshow(mask)
+    plt.show()
+    exit()
+
+    pass
+
 
 def segment_spots(img, cell_labels=None):
 
@@ -254,11 +389,12 @@ def segment_spots(img, cell_labels=None):
 
     # print(f"Total spots detected: {len(blobs)}")
 
-    return spot_mask
-
 if __name__ == "__main__":
 
-    # analyze_image(r"D:\Projects\OIC-274 Rahma\data\03042026\96wellplate_63x_03042026_processed-Scene-001-P1-B03.czi")
-    process_files_in_dir(r"D:\Projects\OIC-274 Rahma\data\03042026", r"D:\Projects\OIC-274 Rahma\processed\2026-03-16")
+    # analyze_image(r"D:\Projects\OIC-274 Rahma\data\03042026\96wellplate_63x_03042026_processed-Scene-010-P1-B06.czi", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07", segment_only=True, useTestSeg=True)
+    # process_files_in_dir(r"D:\Projects\OIC-274 Rahma\data\03042026", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07b")
+
+    analyze_image(r"D:\Projects\OIC-274 Rahma\data\03042026\96wellplate_63x_03042026_processed-Scene-033-P2-C09.czi", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07", segment_only=True, useTestSeg=True)
 
 
+    
