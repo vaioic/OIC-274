@@ -22,16 +22,38 @@ def read_image(filepath):
     # plt.show()
     return frame
 
-def process_files_in_dir(inputpath, outputpath, file_ext="czi"):
+def process_files_in_dir(input_dir, output_dir, mask_dir=None, file_ext="czi"):
 
     # Validate the inputs
-    ip = Path(inputpath)
-
-    op = Path(outputpath)
+    if isinstance(input_dir, str):
+        input_dir = Path(input_dir)
+    elif isinstance(input_dir, Path):
+        pass
+    else:
+        raise TypeError(f"Expected input_dir to be a str or Path. Instead it is a {type(input_dir)}.")
+    
+    if isinstance(output_dir, str):
+        output_dir = Path(output_dir)
+    elif isinstance(output_dir, Path):
+        pass
+    else:
+        raise TypeError(f"Expected output_dir to be a str or Path. Instead it is a {type(output_dir)}.")
+    
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True)
+    elif not output_dir.is_dir():
+        raise ValueError(f"The output path {output_dir} points to a file, not a directory.")
+    
+    if isinstance(mask_dir, str):
+        mask_dir = Path(mask_dir)
+    elif isinstance(mask_dir, Path):
+        pass
+    else:
+        raise TypeError(f"Expected mask_dir to be a str or Path. Instead it is a {type(mask_dir)}.")
 
     # Check if the output CSV-file exists and is locked by another program 
     # (like Excel)
-    output_csv = op / "results.csv"
+    output_csv = output_dir / "results.csv"
     if (output_csv).exists():
         try:
             # We try to open for appending; if locked, this fails instantly
@@ -40,23 +62,36 @@ def process_files_in_dir(inputpath, outputpath, file_ext="czi"):
         except PermissionError:
             raise PermissionError(f"ERROR: The file '{output_csv}' is currently open in Excel or another program.")
 
-    if not op.exists():
-        op.mkdir()
-    
-    if not op.is_dir():
-        raise ValueError(f"The output path {outputpath} points to a file, not a directory.")
+    if mask_dir is None:
+        # Get files from folder
+        files = input_dir.glob(f"*.{file_ext}")
 
-    files = ip.glob(f"*.{file_ext}")
+        all_results = []
 
-    all_results = []
+        for f in files:
+            print(f)
+            ds = analyze_image(f, output_dir)
+            all_results.append(ds)
+        
+        all_ds = xr.concat(all_results, dim="id", join="outer")
+        all_ds.to_netcdf(output_dir / "results.nc")
+    else:
+        # Get mask file names
+        mask_files = mask_dir.glob(f"*_labels.tif")
 
-    for f in files:
-        print(f)
-        ds = analyze_image(f, op)
-        all_results.append(ds)
-    
-    all_ds = xr.concat(all_results, dim="id", join="outer")
-    all_ds.to_netcdf(op / "results.nc")
+        all_results = []
+
+        for m in mask_files:
+
+            f = m.name.replace('_labels.tif', f".{file_ext}")
+
+            print(f"Processing file {input_dir / f} using mask {m}.")
+
+            ds = analyze_image(input_dir / f, output_dir, mask_path=m)
+            all_results.append(ds)
+        
+        all_ds = xr.concat(all_results, dim="id", join="outer")
+        all_ds.to_netcdf(output_dir / "results.nc")
 
     # Save as CSV
     df = all_ds.to_dataframe()
@@ -67,7 +102,7 @@ def process_files_in_dir(inputpath, outputpath, file_ext="czi"):
 
     col_order = ['image', 'cell_label', 'spot_label', 'spot_diameter', 'intensity_mean']
     
-    df.to_csv(op / "results.csv", columns=col_order, index=False)
+    df.to_csv(output_dir / "results.csv", columns=col_order, index=False)
 
     # Calculate summary statistics
     counts = ds.spot_label.groupby(["image", "cell_label"]).count().rename("spot_count")
@@ -75,9 +110,9 @@ def process_files_in_dir(inputpath, outputpath, file_ext="czi"):
 
     summary_ds = xr.merge([counts, means])
     summary_df = summary_ds.to_dataframe()
-    summary_df.to_csv(op / "summary.csv", index=True)
+    summary_df.to_csv(output_dir / "summary.csv", index=True)
 
-def analyze_image(filepath, outputpath, segment_only=False, useTestSeg=False):
+def analyze_image(filepath, outputpath, mask_path=None, segment_only=False):
     """
     Analyze a single image, identifying individual nuclei and labeling each 
     spot.
@@ -115,17 +150,26 @@ def analyze_image(filepath, outputpath, segment_only=False, useTestSeg=False):
     # Image channels are C=0 (puncta), C=1 nucleus
     img = read_image(filepath)
 
-    if not useTestSeg:
-        cell_labels, raw_labels = segment_nuclei(img[..., 1])
-    else:
-        cell_labels, raw_labels = segment_nuclei_test(img[..., 1])
+    # Use masks if provided
+    if mask_path is not None:
+        cell_labels = skimage.io.imread(mask_path)
 
+        # Remove labels that intersect with image border
+        cell_labels = skimage.segmentation.clear_border(cell_labels)        
+        
+    else:
+        cell_labels, raw_labels = segment_nuclei(img[..., 1])
+
+    # Primarily for debugging
     if segment_only:
-        overlay = skimage.segmentation.mark_boundaries(img[..., 1], cell_labels, color=(1, 1, 0), mode='thick')
+        overlay = skimage.segmentation.mark_boundaries(
+            skimage.exposure.rescale_intensity(img[..., 1], out_range=(0.0, 1.0)), 
+            cell_labels, 
+            color=(1, 1, 0), 
+            mode='thick')
         plt.imshow(overlay)
         plt.show()
         exit()
-
 
     spot_labels = segment_spots(img[..., 0], cell_labels)
 
@@ -184,15 +228,77 @@ def analyze_image(filepath, outputpath, segment_only=False, useTestSeg=False):
     plt.savefig(outputpath / (filepath.stem + ".png"), dpi=300, bbox_inches='tight', pad_inches=0.1)
     plt.close(fig)
 
-    # Save the raw labels as well
-    raw_label_matrix_16 = raw_labels.astype(np.uint16)
+    if mask_path is None:
+        # Save the raw labels if a pre-made mask was not used
+        raw_label_matrix_16 = raw_labels.astype(np.uint16)
 
-    # Save as a TIFF
-    skimage.io.imsave(outputpath / (filepath.stem + "_labels.tif"), raw_label_matrix_16, check_contrast=False)
-
-    print(f"File saved to {outputpath / (filepath.stem + '.png')}")
+        # Save as a TIFF
+        skimage.io.imsave(outputpath / (filepath.stem + "_labels.tif"), raw_label_matrix_16, check_contrast=False)
 
     return ds
+
+def segment_cells_cp(image_dir, output_dir, cell_diameter=125):
+    """
+    Generate segmentation masks for the nuclei using Cellpose.
+
+    This function uses the Cellpose 'nuclei' model to help segment nuclei labeled with DAPI. The inferred labels will be saved as a TIFF-file in the output_dir.
+    
+    Parameters
+    ----------
+    image_dir : str or Path
+        Path to the directory of images
+    output_dir : str or Path
+        Path to the output directory to save masks
+    cell_diameter : int, optional
+        Estimated cell diameter used by Cellpose, by default 125
+
+    Raises
+    ------
+    ValueError
+        The image_dir must be a str or Path
+    ValueError
+        The output_dir must be a str or Path
+    """
+
+    # Validate the input directory
+    if isinstance(image_dir, str):
+        image_dir = Path(image_dir)
+    elif isinstance(image_dir, Path):
+        pass
+    else:
+        raise ValueError(f"Expected image_dir to be a str or Path. Instead it is {type(image_dir)}.")
+    
+    # Validate the output directory
+    if isinstance(output_dir, str):
+        output_dir = Path(output_dir)
+    elif isinstance(output_dir, Path):
+        pass
+    else:
+        raise ValueError(f"Expected output_dir to be a str or Path. Instead it is {type(output_dir)}.")
+    
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True)
+
+    # Run cellpose    
+    from cellpose import models
+
+    model = models.CellposeModel(gpu=False, model_type='nuclei')
+
+    files = image_dir.glob('*.czi')
+
+    for f in files:
+        img = read_image(f)
+
+        img_nucl = img[..., 1]
+        
+        # Normalize the intensity of the image
+        img_norm = skimage.exposure.rescale_intensity(img_nucl, out_range=(0.0, 1.0))    
+
+        mask, _, _ = model.eval(img_norm, diameter=cell_diameter)
+        
+        skimage.io.imsave(output_dir / (f.stem + "_labels.tif"), mask.astype('uint16'))
+
+
 
 def generate_rgb_image(img):
 
@@ -201,7 +307,7 @@ def generate_rgb_image(img):
     img[..., 1] = (img[..., 1] - np.min(img[..., 1]))/(np.max(img[..., 1]) - np.min(img[..., 1]))
     img[..., 0] = (img[..., 0] - np.min(img[..., 0]))/(np.max(img[..., 0]) - np.min(img[..., 0]))
 
-    img[..., 0] = 2.5 * img[..., 0]
+    img[..., 0] = 3 * img[..., 0]
     img[..., 0] = np.clip(img[..., 0], 0, 1)
 
     rgb_image = np.zeros((img.shape[0], img.shape[1], 3))
@@ -293,56 +399,26 @@ def segment_nuclei(img):
 
     return cleaned_labels, labels
 
-def segment_nuclei_test(img):
+def segment_spots(img, cell_labels=None, spot_thresh=0.02):
+    """
+    Segment spots in images
 
-    # Normalize the intensity of the image
-    img_norm = skimage.exposure.rescale_intensity(img, out_range=(0.0, 1.0))
+    This function uses the difference of Gaussians method to identify spots in images.
 
-    img_filtered = skimage.filters.median(img_norm, skimage.morphology.footprint_rectangle((5, 5)))
-    img_filtered = skimage.filters.gaussian(img_filtered, sigma=1.0)
-    img_filtered = skimage.filters.unsharp_mask(img_filtered, radius=10, amount=2)
+    Parameters
+    ----------
+    img : ndarray
+        Image of the spot channel.
+    cell_labels : ndarray, optional
+        Cell labels, by default None. If provided, the function will remove spots that are outside of cells.
+    spot_thresh : float, optional
+        Threshold of difference to use for spots, by default 0.02. Increasing this value will reduce the number of labelled pixels.
 
-    # plt.imshow(img_filtered)
-    # plt.show()
-    # exit()
-
-    thresh = skimage.filters.threshold_triangle(img_filtered)
-
-    mask = img_filtered > thresh
-    mask = skimage.morphology.closing(mask, skimage.morphology.disk(15))
-    mask = skimage.morphology.opening(mask, skimage.morphology.disk(40))    
-
-    mask = skimage.morphology.remove_small_holes(mask, max_size=10000)
-    mask = skimage.morphology.remove_small_objects(mask, max_size=1000)
-    mask = skimage.segmentation.clear_border(mask)
-
-    plt.imshow(mask)
-    plt.show()
-    exit()
-
-    distance = ndi.distance_transform_edt(mask)
-
-    # 2. Find local peaks (the centers of your cells)
-    # min_distance should be roughly the radius of your smallest cell
-    coords = skimage.feature.peak_local_max(distance, min_distance=25, labels=mask)
-    mask_seeds = np.zeros(distance.shape, dtype=bool)
-    mask_seeds[tuple(coords.T)] = True
-    markers = skimage.measure.label(mask_seeds)
-
-    # 3. Use the Adaptive mask as the "topology" to prevent merging
-    # We use the inverse of the distance map as the "basin"
-    labels = skimage.segmentation.watershed(-distance, markers, mask=mask)
-
-    overlay = skimage.segmentation.mark_boundaries(img_norm, labels)
-
-    plt.imshow(mask)
-    plt.show()
-    exit()
-
-    pass
-
-
-def segment_spots(img, cell_labels=None):
+    Returns
+    -------
+    _type_
+        _description_
+    """
 
     filtered_img = skimage.filters.median(img, skimage.morphology.disk(2))
 
@@ -359,42 +435,14 @@ def segment_spots(img, cell_labels=None):
 
     return spot_labels
 
-    # plt.subplot(1, 2, 1)
-    # plt.imshow(diff_of_gaussians)
-    # plt.subplot(1, 2, 2)
-    # plt.imshow(spot_mask)
-    # plt.show()
-
-    # print(np.max(filtered_img), np.min(filtered_img))
-
-    # blobs = skimage.feature.blob_dog(filtered_img, min_sigma=0.1, max_sigma=10, threshold=0.01)
-
-    # blobs[:, 2] = blobs[:, 2] * sqrt(2)
-
-    # print("Plotting")
-
-    # fig, ax = plt.subplots(figsize=(9, 9))
-    # ax.imshow(img)
-    # ax.set_title("Detected Spots (LoG)")
-
-    # for blob in blobs:
-    #     y, x, r = blob
-    #     # Add a yellow circle for each detected spot
-    #     c = plt.Circle((x, y), r, color='yellow', linewidth=2, fill=False)
-    #     ax.add_patch(c)
-
-    # plt.axis('off')
-    # plt.tight_layout()
-    # plt.show()
-
-    # print(f"Total spots detected: {len(blobs)}")
 
 if __name__ == "__main__":
 
     # analyze_image(r"D:\Projects\OIC-274 Rahma\data\03042026\96wellplate_63x_03042026_processed-Scene-010-P1-B06.czi", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07", segment_only=True, useTestSeg=True)
     # process_files_in_dir(r"D:\Projects\OIC-274 Rahma\data\03042026", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07b")
 
-    analyze_image(r"D:\Projects\OIC-274 Rahma\data\03042026\96wellplate_63x_03042026_processed-Scene-033-P2-C09.czi", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07", segment_only=True, useTestSeg=True)
+    # analyze_image(r"D:\Projects\OIC-274 Rahma\data\03042026\96wellplate_63x_03042026_processed-Scene-033-P2-C09.czi", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07", segment_only=True, useTestSeg=True)
 
+    # segment_cells_cp(r"D:\Projects\OIC-274 Rahma\data\03042026", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07b\masks")
 
-    
+    process_files_in_dir(r"D:\Projects\OIC-274 Rahma\data\03042026", r"D:\Projects\OIC-274 Rahma\processed\2026-04-10b", mask_dir=r"D:\Projects\OIC-274 Rahma\processed\2026-04-09b\masks")
