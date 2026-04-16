@@ -75,6 +75,7 @@ def process_files_in_dir(input_dir, output_dir, mask_dir=None, file_ext="czi"):
         
         all_ds = xr.concat(all_results, dim="id", join="outer")
         all_ds.to_netcdf(output_dir / "results.nc")
+
     else:
         # Get mask file names
         mask_files = mask_dir.glob(f"*_labels.tif")
@@ -104,12 +105,23 @@ def process_files_in_dir(input_dir, output_dir, mask_dir=None, file_ext="czi"):
     
     df.to_csv(output_dir / "results.csv", columns=col_order, index=False)
 
-    # Calculate summary statistics
-    counts = ds.spot_label.groupby(["image", "cell_label"]).count().rename("spot_count")
-    means = ds.intensity_mean.groupby(["image", "cell_label"]).mean().rename("avg_intensity")
+    # Calculate summary statistics by image
+    cell_count = df.groupby('image')['cell_label'].nunique()
+    cell_count_xr = cell_count.to_xarray().rename("cell_count")
+    
+    # Calculate summary statistics - change to number of spots per cell, number of cells etc.
+    spots_per_cell = all_ds.spot_label.groupby(["image", "cell_label"]).count().rename("spot_count")
+    spot_intensity_per_cell = all_ds.intensity_mean.groupby(["image", "cell_label"]).mean().rename("avg_intensity")
 
-    summary_ds = xr.merge([counts, means])
+    mean_spots_per_cell = spots_per_cell.groupby("image").mean()
+
+    mean_spot_intensity_per_cell = spot_intensity_per_cell.groupby("image").mean()
+
+    summary_ds = xr.merge([cell_count_xr, mean_spots_per_cell, mean_spot_intensity_per_cell])
     summary_df = summary_ds.to_dataframe()
+    # df = df.rename(columns={
+    #     'feret_diameter_max': 'spot_diameter'
+    # })
     summary_df.to_csv(output_dir / "summary.csv", index=True)
 
 def analyze_image(filepath, outputpath, mask_path=None, segment_only=False):
@@ -190,7 +202,7 @@ def analyze_image(filepath, outputpath, mask_path=None, segment_only=False):
         num_spots = len(spot_props['label'])
         curr_ds = xr.Dataset(
             data_vars={
-                key: (['id'], val)
+                key: (["id"], val)
                 for key, val in spot_props.items() if key != 'label'
             },
             coords={
@@ -210,23 +222,39 @@ def analyze_image(filepath, outputpath, mask_path=None, segment_only=False):
     # overlay = skimage.color.label2rgb(cell_labels, rgb_image, bg_label=0, kind='overlay', image_alpha=0.8)
     overlay = skimage.segmentation.mark_boundaries(rgb_image, cell_labels, color=(1, 1, 0), mode='thick')
 
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.imshow(overlay)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 10))
+    ax[0].imshow(overlay)
 
     # 2. Add cell numbers
     for prop in cell_props:
         y, x = prop.centroid
-        ax.text(x, y, str(prop.label), color='yellow', fontsize=9, fontweight='normal')
+        ax[0].text(x, y, str(prop.label), color='yellow', fontsize=9, fontweight='normal')
 
     # 3. Add spots as distinct markers
     # We use a scatter plot so they stand out against the background
     spot_props = skimage.measure.regionprops(spot_labels)
     if spot_props:
         sy, sx = zip(*[p.centroid for p in spot_props])
-        ax.scatter(sx, sy, s=30, marker='o', label='Spots', facecolors='none', edgecolors='cyan', linewidths=0.5)
+        ax[0].scatter(sx, sy, s=1, marker='.', label='Spots', color='cyan', linewidths=0.5)
+
+    # Normalize the spot image
+    spot_ch = (img[..., 0]).copy()
+    spot_ch = (spot_ch - np.min(spot_ch))/(np.max(spot_ch) - np.min(spot_ch))
+
+    spot_ch = 3 * spot_ch
+    spot_ch = np.clip(spot_ch, 0, 1)
+
+    spot_ch_overlay = skimage.segmentation.mark_boundaries(spot_ch, cell_labels, color=(1, 1, 0), mode='thick')
+
+    ax[1].imshow(spot_ch_overlay)
+    # if spot_props:
+    #     sy, sx = zip(*[p.centroid for p in spot_props])
+    #     ax[1].scatter(sx, sy, s=5, marker='+', label='Spots', facecolors='none', edgecolors='cyan', linewidths=0.5)
 
     plt.savefig(outputpath / (filepath.stem + ".png"), dpi=300, bbox_inches='tight', pad_inches=0.1)
     plt.close(fig)
+
+    # Also save the spot image on its own
 
     if mask_path is None:
         # Save the raw labels if a pre-made mask was not used
@@ -426,9 +454,30 @@ def segment_spots(img, cell_labels=None, spot_thresh=0.02):
 
     diff_of_gaussians = skimage.filters.difference_of_gaussians(filtered_img, 2, 8)
 
-    spot_mask = diff_of_gaussians > 0.02
+    # # Calculate a threshold value
+    # global_spot_mean = np.mean(filtered_img)
+    # background_mean = np.mean(filtered_img[filtered_img < global_spot_mean])
+    # background_std = np.std(filtered_img[filtered_img < global_spot_mean])
+    # spot_thresh = background_mean + 3 * background_std
+    # bright_regions = filtered_img > spot_thresh
+
+    # plt.imshow(bright_regions)
+    # plt.show()
+    # # exit()
+
+    spot_mask = diff_of_gaussians > (5 * np.std(diff_of_gaussians))
+
+    # plt.imshow(spot_mask)
+    # plt.show()
+    # exit()
+
+    # spot_mask = spot_mask & bright_regions
+
 
     if cell_labels is not None:
+        # Shrink the cell labels a little to avoid spots along the edge
+        cell_labels = skimage.morphology.erosion(cell_labels, skimage.morphology.disk(3))
+
         spot_mask = spot_mask & (cell_labels > 0)
 
     spot_labels = skimage.measure.label(spot_mask)
@@ -445,4 +494,4 @@ if __name__ == "__main__":
 
     # segment_cells_cp(r"D:\Projects\OIC-274 Rahma\data\03042026", r"D:\Projects\OIC-274 Rahma\processed\2026-04-07b\masks")
 
-    process_files_in_dir(r"D:\Projects\OIC-274 Rahma\data\03042026", r"D:\Projects\OIC-274 Rahma\processed\2026-04-10b", mask_dir=r"D:\Projects\OIC-274 Rahma\processed\2026-04-09b\masks")
+    process_files_in_dir(r"D:\Projects\OIC-274 Rahma\data\03042026", r"D:\Projects\OIC-274 Rahma\processed\2026-04-15", mask_dir=r"D:\Projects\OIC-274 Rahma\processed\2026-04-09b\masks")
